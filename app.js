@@ -97,7 +97,9 @@
   function LocalModeBanner() {
     if (DB.mode !== "local") return null;
     return html`<div class="bg-amber-100 text-amber-900 text-xs text-center px-4 py-1.5">
-      <strong>Modo local de teste:</strong> o Supabase ainda não foi configurado (config.js). Os protótipos ficam salvos só neste navegador.
+      <strong>Modo local de teste:</strong> ${DB.localReason === "sdk"
+        ? "o config.js está preenchido, mas a biblioteca do Supabase não carregou (verifique a internet/bloqueio de rede e recarregue)."
+        : "o config.js publicado está sem a URL ou a chave do Supabase."} Os protótipos ficam salvos só neste navegador.
     </div>`;
   }
 

@@ -118,6 +118,8 @@
     };
   }
 
-  const configured = cfg.SUPABASE_URL && cfg.SUPABASE_ANON_KEY && window.supabase;
-  window.DB = configured ? supabaseApi() : localApi();
+  const hasConfig = !!(cfg.SUPABASE_URL && cfg.SUPABASE_ANON_KEY);
+  window.DB = hasConfig && window.supabase ? supabaseApi() : localApi();
+  // Motivo do modo local, para a faixa amarela explicar o que falta
+  window.DB.localReason = !hasConfig ? "config" : !window.supabase ? "sdk" : null;
 })();
