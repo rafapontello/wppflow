@@ -4,6 +4,7 @@
 (function () {
   const cfg = window.WPPFLOW_CONFIG || {};
   const LIST_COLUMNS = "id, name, screen_count, is_public, share_token, created_at, updated_at";
+  const IMAGE_BUCKET = cfg.IMAGE_BUCKET || "prototype-images";
 
   function checkDomain(email) {
     const dom = (cfg.ALLOWED_DOMAIN || "").toLowerCase();
@@ -23,6 +24,10 @@
       [/Database error saving new user/i, `Só e-mails @${cfg.ALLOWED_DOMAIN} podem criar conta.`],
       [/rate limit/i, "Muitas tentativas seguidas. Aguarde alguns minutos e tente de novo."],
       [/Failed to fetch/i, "Sem conexão com o servidor. Verifique sua internet."],
+      [/statement timeout/i, "O servidor demorou para responder. Tente salvar de novo em instantes."],
+      [/Bucket not found/i, "O espaço de imagens ainda não foi criado no Supabase (rode o storage.sql)."],
+      [/row-level security/i, "Sem permissão para enviar imagens. Confira se o storage.sql foi rodado no Supabase."],
+      [/(exceeded the maximum allowed size|Payload too large)/i, "Uma das imagens passa de 10 MB. Use uma imagem menor."],
     ];
     for (const [re, txt] of map) if (re.test(m)) return new Error(txt);
     return err instanceof Error ? err : new Error(m);
@@ -33,9 +38,78 @@
   };
   const must = ({ data, error }) => { if (error) throw error; return data; };
 
+  // ---------------- Imagens fora do protótipo ----------------
+  // O editor guarda imagens como texto base64 dentro do protótipo, o que deixa cada
+  // salvamento pesado. Antes de salvar, cada imagem é enviada uma única vez para o
+  // Supabase Storage e, no protótipo, fica só o link dela. Protótipos antigos são
+  // convertidos sozinhos no próximo salvamento.
+  const DATA_URL_RE = /^data:image\/(png|jpe?g|gif|webp);base64,/i;
+  const MIN_SIZE = 4096; // imagens muito pequenas (ícones) continuam dentro do protótipo
+  const EXT = { "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp" };
+  const uploaded = new Map(); // base64 -> link, para não reenviar a mesma imagem
+
+  function dataUrlToBytes(url) {
+    const comma = url.indexOf(",");
+    let mime = url.slice(5, url.indexOf(";")).toLowerCase();
+    if (mime === "image/jpg") mime = "image/jpeg";
+    const bin = atob(url.slice(comma + 1));
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return { bytes, mime };
+  }
+  async function sha256(bytes) {
+    const h = await crypto.subtle.digest("SHA-256", bytes);
+    return Array.from(new Uint8Array(h), (b) => b.toString(16).padStart(2, "0")).join("");
+  }
+  const isImage = (v) => typeof v === "string" && v.length > MIN_SIZE && DATA_URL_RE.test(v);
+  function collect(node, out) {
+    if (isImage(node)) out.add(node);
+    else if (Array.isArray(node)) node.forEach((n) => collect(n, out));
+    else if (node && typeof node === "object") Object.values(node).forEach((n) => collect(n, out));
+    return out;
+  }
+  function replace(node) {
+    if (isImage(node)) return uploaded.get(node) || node;
+    if (Array.isArray(node)) return node.map(replace);
+    if (node && typeof node === "object") {
+      const o = {};
+      for (const k in node) o[k] = replace(node[k]);
+      return o;
+    }
+    return node;
+  }
+  async function externalizeImages(snap, upload) {
+    const pending = [...collect(snap, new Set())].filter((u) => !uploaded.has(u));
+    // até 4 envios ao mesmo tempo
+    let i = 0;
+    const worker = async () => {
+      while (i < pending.length) {
+        const u = pending[i++];
+        uploaded.set(u, await upload(u));
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(4, pending.length) }, worker));
+    return replace(snap);
+  }
+
   // ---------------- Supabase ----------------
   function supabaseApi() {
     const sb = window.supabase.createClient(cfg.SUPABASE_URL, cfg.SUPABASE_ANON_KEY);
+
+    async function uploadImage(dataUrl) {
+      const { bytes, mime } = dataUrlToBytes(dataUrl);
+      const { data } = await sb.auth.getSession();
+      const uid = data.session?.user?.id;
+      if (!uid) throw new Error("Sua sessão expirou. Entre de novo para salvar.");
+      // O nome do arquivo é a "impressão digital" da imagem: a mesma imagem nunca é enviada duas vezes
+      const path = `${uid}/${await sha256(bytes)}.${EXT[mime]}`;
+      const { error } = await sb.storage.from(IMAGE_BUCKET).upload(path, new Blob([bytes], { type: mime }), {
+        contentType: mime, cacheControl: "31536000", upsert: false,
+      });
+      if (error && !/already exists|duplicate/i.test(error.message) && String(error.statusCode) !== "409") throw error;
+      return sb.storage.from(IMAGE_BUCKET).getPublicUrl(path).data.publicUrl;
+    }
+
     return {
       mode: "supabase",
       async getUser() { const { data } = await sb.auth.getSession(); return data.session?.user || null; },
@@ -61,6 +135,7 @@
       list: wrap(async () => must(await sb.from("prototypes").select(LIST_COLUMNS).order("updated_at", { ascending: false }))),
       get: wrap(async (id) => must(await sb.from("prototypes").select("*").eq("id", id).single())),
       create: wrap(async ({ name, data }) => must(await sb.from("prototypes").insert({ name, data }).select(LIST_COLUMNS).single())),
+      prepareForSave: wrap(async (snap) => externalizeImages(snap, uploadImage)),
       update: wrap(async (id, patch) => must(await sb.from("prototypes").update(patch).eq("id", id).select(LIST_COLUMNS).single())),
       remove: wrap(async (id) => must(await sb.from("prototypes").delete().eq("id", id))),
       getShared: wrap(async (token) => {
@@ -113,6 +188,7 @@
         if (!r) throw new Error("Protótipo não encontrado.");
         Object.assign(r, patch, { updated_at: now() }); save(db); return pick(r);
       }),
+      prepareForSave: async (snap) => snap, // no modo local as imagens ficam no navegador
       remove: wrap(async (id) => { const db = load(); db.rows = db.rows.filter((r) => r.id !== id); save(db); }),
       getShared: wrap(async (token) => { const r = load().rows.find((x) => x.share_token === token && x.is_public); return r ? { name: r.name, data: r.data, updated_at: r.updated_at } : null; }),
     };

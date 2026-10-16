@@ -387,7 +387,7 @@
     const latest = useRef(null);
     const savedJson = useRef(null);
     const timer = useRef(null);
-    const inflight = useRef(null);
+    const queue = useRef(Promise.resolve());
     const emptyAtLoad = useRef(false);
 
     useEffect(() => {
@@ -404,25 +404,31 @@
       return () => { alive = false; clearTimeout(timer.current); document.title = "WPP Flow — Protótipos de Conversa"; };
     }, [id]);
 
-    const save = useCallback(async () => {
+    // Fila de salvamento: uma gravação por vez, na ordem. Se o autosave disparar
+    // enquanto outra gravação está em andamento, ele espera a anterior terminar.
+    const save = useCallback(() => {
       clearTimeout(timer.current);
-      if (inflight.current) await inflight.current;
-      const snap = latest.current;
-      if (!snap) return;
-      const json = JSON.stringify(snap);
-      if (json === savedJson.current) { setStatus("saved"); return; }
-      setStatus("saving");
-      const p = DB.update(id, { data: snap })
-        .then((row) => {
+      const run = queue.current.then(async () => {
+        const snap = latest.current;
+        if (!snap) return;
+        const json = JSON.stringify(snap);
+        if (json === savedJson.current) { setStatus("saved"); return; }
+        setStatus("saving");
+        try {
+          // Tira as imagens de dentro do protótipo e envia para o Supabase Storage
+          const data = await DB.prepareForSave(snap);
+          const row = await DB.update(id, { data });
           savedJson.current = json;
           setProto((old) => ({ ...old, ...row }));
           setSavedAt(new Date());
           setStatus(JSON.stringify(latest.current) === json ? "saved" : "dirty");
-        })
-        .catch((e) => { setStatus("error"); toast("Não foi possível salvar: " + e.message, "error"); });
-      inflight.current = p;
-      await p;
-      inflight.current = null;
+        } catch (e) {
+          setStatus("error");
+          toast("Não foi possível salvar: " + e.message, "error");
+        }
+      });
+      queue.current = run;
+      return run;
     }, [id]);
 
     const onChange = useCallback((snap) => {
